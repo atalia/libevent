@@ -102,6 +102,9 @@
 /* Define to 1 if you have the `epoll_ctl' function. */
 #cmakedefine EVENT__HAVE_EPOLL_CTL 1
 
+/* Define if your system supports the wepoll module */
+#cmakedefine EVENT__HAVE_WEPOLL 1
+
 /* Define to 1 if you have the `eventfd' function. */
 #cmakedefine EVENT__HAVE_EVENTFD 1
 
@@ -211,6 +214,9 @@
 /* Define if the system has openssl */
 #cmakedefine EVENT__HAVE_OPENSSL 1
 
+/* Define if the system has mbedtls */
+#cmakedefine EVENT__HAVE_MBEDTLS 1
+
 /* Define to 1 if you have the `pipe' function. */
 #cmakedefine EVENT__HAVE_PIPE 1
 
@@ -231,6 +237,9 @@
 
 /* Define if we have pthreads on this system */
 #cmakedefine EVENT__HAVE_PTHREADS 1
+
+/* Define to 1 if you have the `pthread_mutexattr_setprotocol' function. */
+#cmakedefine EVENT__HAVE_PTHREAD_MUTEXATTR_SETPROTOCOL 1
 
 /* Define to 1 if you have the `putenv' function. */
 #cmakedefine EVENT__HAVE_PUTENV 1
@@ -262,9 +271,6 @@
 /* Define to 1 if you have the `strsignal' function. */
 #cmakedefine EVENT__HAVE_STRSIGNAL 1
 
-/* Define to 1 if you have the `splice' function. */
-#cmakedefine EVENT__HAVE_SPLICE 1
-
 /* Define to 1 if you have the <stdarg.h> header file. */
 #cmakedefine EVENT__HAVE_STDARG_H 1
 
@@ -276,9 +282,6 @@
 
 /* Define to 1 if you have the <stdlib.h> header file. */
 #cmakedefine EVENT__HAVE_STDLIB_H 1
-
-/* Define to 1 if you have the <strings.h> header file. */
-#cmakedefine EVENT__HAVE_STRINGS_H 1
 
 /* Define to 1 if you have the <string.h> header file. */
 #cmakedefine EVENT__HAVE_STRING_H 1
@@ -442,9 +445,6 @@
 
 /* Define to 1 if you have the `unsetenv' function. */
 #cmakedefine EVENT__HAVE_UNSETENV 1
-
-/* Define to 1 if you have the `vasprintf' function. */
-#cmakedefine EVENT__HAVE_VASPRINTF 1
 
 /* Define if kqueue works correctly with pipes */
 #cmakedefine EVENT__HAVE_WORKING_KQUEUE 1

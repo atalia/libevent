@@ -66,6 +66,8 @@
 #include "regress.h"
 #include "regress_testutils.h"
 
+#define ARRAY_SIZE(x) (sizeof(x)/sizeof((x)[0]))
+
 /* set if a test needs to call loopexit on a base */
 static struct event_base *exit_base;
 
@@ -98,6 +100,7 @@ static void http_basic_cb(struct evhttp_request *req, void *arg);
 static void http_timeout_cb(struct evhttp_request *req, void *arg);
 static void http_large_cb(struct evhttp_request *req, void *arg);
 static void http_chunked_cb(struct evhttp_request *req, void *arg);
+static void http_chunked_input_cb(struct evhttp_request *req, void *arg);
 static void http_post_cb(struct evhttp_request *req, void *arg);
 static void http_put_cb(struct evhttp_request *req, void *arg);
 static void http_genmethod_cb(struct evhttp_request *req, void *arg);
@@ -109,8 +112,9 @@ static void http_dispatcher_cb(struct evhttp_request *req, void *arg);
 static void http_on_complete_cb(struct evhttp_request *req, void *arg);
 
 #define HTTP_BIND_IPV6 1
-#define HTTP_BIND_SSL 2
+#define HTTP_OPENSSL 2
 #define HTTP_SSL_FILTER 4
+#define HTTP_MBEDTLS 8
 static int
 http_bind(struct evhttp *myhttp, ev_uint16_t *pport, int mask)
 {
@@ -152,6 +156,16 @@ https_bev(struct event_base *base, void *arg)
 		BEV_OPT_CLOSE_ON_FREE);
 }
 #endif
+#ifdef EVENT__HAVE_MBEDTLS
+static struct bufferevent *
+https_mbedtls_bev(struct event_base *base, void *arg)
+{
+	mbedtls_ssl_context *ssl = mbedtls_ssl_new(get_mbedtls_config(MBEDTLS_SSL_IS_SERVER));
+	return bufferevent_mbedtls_socket_new(
+		base, -1, ssl, BUFFEREVENT_SSL_ACCEPTING,
+		BEV_OPT_CLOSE_ON_FREE);
+}
+#endif
 static struct evhttp *
 http_setup_gencb(ev_uint16_t *pport, struct event_base *base, int mask,
 	void (*cb)(struct evhttp_request *, void *), void *cbarg)
@@ -164,9 +178,14 @@ http_setup_gencb(ev_uint16_t *pport, struct event_base *base, int mask,
 	if (http_bind(myhttp, pport, mask) < 0)
 		return NULL;
 #ifdef EVENT__HAVE_OPENSSL
-	if (mask & HTTP_BIND_SSL) {
+	if (mask & HTTP_OPENSSL) {
 		init_ssl();
 		evhttp_set_bevcb(myhttp, https_bev, NULL);
+	}
+#endif
+#ifdef EVENT__HAVE_MBEDTLS
+	if (mask & HTTP_MBEDTLS) {
+		evhttp_set_bevcb(myhttp, https_mbedtls_bev, NULL);
 	}
 #endif
 
@@ -181,6 +200,7 @@ http_setup_gencb(ev_uint16_t *pport, struct event_base *base, int mask,
 	evhttp_set_cb(myhttp, "/timeout", http_timeout_cb, myhttp);
 	evhttp_set_cb(myhttp, "/large", http_large_cb, base);
 	evhttp_set_cb(myhttp, "/chunked", http_chunked_cb, base);
+	evhttp_set_cb(myhttp, "/chunked_input", http_chunked_input_cb, base);
 	evhttp_set_cb(myhttp, "/streamed", http_chunked_cb, base);
 	evhttp_set_cb(myhttp, "/postit", http_post_cb, base);
 	evhttp_set_cb(myhttp, "/putit", http_put_cb, base);
@@ -265,6 +285,8 @@ evbuffer_datacmp(struct evbuffer *buf, const char *s)
 		return -1;
 
 	d = evbuffer_pullup(buf, s_sz);
+	if (!d)
+		d = (unsigned char *)"";
 	if ((r = memcmp(d, s, s_sz)))
 		return r;
 
@@ -491,15 +513,27 @@ http_chunked_cb(struct evhttp_request *req, void *arg)
 	event_base_once(arg, -1, EV_TIMEOUT, http_chunked_trickle_cb, state, &when);
 }
 
-static struct bufferevent *
-create_bev(struct event_base *base, evutil_socket_t fd, int ssl_mask)
+static void
+http_chunked_input_cb(struct evhttp_request *req, void *arg)
 {
-	int flags = BEV_OPT_DEFER_CALLBACKS;
+	struct evbuffer *buf = evbuffer_new();
+	TT_BLATHER(("%s: called\n", __func__));
+
+	evbuffer_add_buffer(buf, evhttp_request_get_input_buffer(req));
+	evhttp_send_reply(req, HTTP_OK, "OK", buf);
+
+	evbuffer_free(buf);
+}
+
+static struct bufferevent *
+create_bev(struct event_base *base, evutil_socket_t fd, int ssl_mask, int flags_)
+{
+	int flags = BEV_OPT_DEFER_CALLBACKS | flags_;
 	struct bufferevent *bev = NULL;
 
 	if (!ssl_mask) {
 		bev = bufferevent_socket_new(base, fd, flags);
-	} else {
+	} else if (ssl_mask & HTTP_OPENSSL){
 #ifdef EVENT__HAVE_OPENSSL
 		SSL *ssl = SSL_new(get_ssl_ctx());
 		if (ssl_mask & HTTP_SSL_FILTER) {
@@ -512,6 +546,20 @@ create_bev(struct event_base *base, evutil_socket_t fd, int ssl_mask)
 				base, fd, ssl, BUFFEREVENT_SSL_CONNECTING, flags);
 		}
 		bufferevent_openssl_set_allow_dirty_shutdown(bev, 1);
+#endif
+	} else if (ssl_mask & HTTP_MBEDTLS) {
+#ifdef EVENT__HAVE_MBEDTLS
+		mbedtls_ssl_context *ssl = mbedtls_ssl_new(get_mbedtls_config(MBEDTLS_SSL_IS_CLIENT));
+		if (ssl_mask & HTTP_SSL_FILTER) {
+			struct bufferevent *underlying =
+			bufferevent_socket_new(base, fd, flags);
+			bev = bufferevent_mbedtls_filter_new(
+				base, underlying, ssl, BUFFEREVENT_SSL_CONNECTING, flags);
+		} else {
+			bev = bufferevent_mbedtls_socket_new(
+				base, fd, ssl, BUFFEREVENT_SSL_CONNECTING, flags);
+		}
+		bufferevent_mbedtls_set_allow_dirty_shutdown(bev, 1);
 #endif
 	}
 
@@ -542,7 +590,7 @@ http_basic_test_impl(void *arg, int ssl, const char *request_line)
 	evutil_socket_t fd;
 	const char *http_request;
 	ev_uint16_t port = 0, port2 = 0;
-	int server_flags = ssl ? HTTP_BIND_SSL : 0;
+	int server_flags = ssl;
 	struct evhttp *http = http_setup(&port, data->base, server_flags);
 	struct evbuffer *out;
 
@@ -557,7 +605,7 @@ http_basic_test_impl(void *arg, int ssl, const char *request_line)
 	fd = http_connect("127.0.0.1", port);
 
 	/* Stupid thing to send a request */
-	bev = create_bev(data->base, fd, ssl);
+	bev = create_bev(data->base, fd, ssl, BEV_OPT_CLOSE_ON_FREE);
 	bufferevent_setcb(bev, http_readcb, http_half_writecb,
 	    http_errorcb, data->base);
 	out = bufferevent_get_output(bev);
@@ -573,12 +621,11 @@ http_basic_test_impl(void *arg, int ssl, const char *request_line)
 
 	/* connect to the second port */
 	bufferevent_free(bev);
-	evutil_closesocket(fd);
 
 	fd = http_connect("127.0.0.1", port2);
 
 	/* Stupid thing to send a request */
-	bev = create_bev(data->base, fd, ssl);
+	bev = create_bev(data->base, fd, ssl, BEV_OPT_CLOSE_ON_FREE);
 	bufferevent_setcb(bev, http_readcb, http_writecb,
 	    http_errorcb, data->base);
 	out = bufferevent_get_output(bev);
@@ -595,12 +642,11 @@ http_basic_test_impl(void *arg, int ssl, const char *request_line)
 
 	/* Connect to the second port again. This time, send an absolute uri. */
 	bufferevent_free(bev);
-	evutil_closesocket(fd);
 
 	fd = http_connect("127.0.0.1", port2);
 
 	/* Stupid thing to send a request */
-	bev = create_bev(data->base, fd, ssl);
+	bev = create_bev(data->base, fd, ssl, BEV_OPT_CLOSE_ON_FREE);
 	bufferevent_setcb(bev, http_readcb, http_writecb,
 	    http_errorcb, data->base);
 
@@ -1270,7 +1316,7 @@ http_connection_test_(struct basic_test_data *data, int persistent,
 	if (ipv6)
 		mask |= HTTP_BIND_IPV6;
 	if (ssl)
-		mask |= HTTP_BIND_SSL;
+		mask |= HTTP_OPENSSL;
 
 	http = http_setup(&port, data->base, mask);
 
@@ -1416,7 +1462,7 @@ http_connection_async_test(void *arg)
 	struct evhttp *http = http_setup(&port, data->base, 0);
 
 	exit_base = data->base;
-	tt_assert(regress_dnsserver(data->base, &portnum, search_table));
+	tt_assert(regress_dnsserver(data->base, &portnum, search_table, NULL));
 
 	dns_base = evdns_base_new(data->base, 0/* init name servers */);
 	tt_assert(dns_base);
@@ -1505,6 +1551,7 @@ http_autofree_connection_test(void *arg)
 	struct evhttp_connection *evcon = NULL;
 	struct evhttp_request *req[2] = { NULL };
 	struct evhttp *http = http_setup(&port, data->base, 0);
+	size_t i;
 
 	test_ok = 0;
 
@@ -1519,19 +1566,14 @@ http_autofree_connection_test(void *arg)
 	req[1] = evhttp_request_new(http_request_empty_done, data->base);
 
 	/* Add the information that we care about */
-	evhttp_add_header(evhttp_request_get_output_headers(req[0]), "Host", "somehost");
-	evhttp_add_header(evhttp_request_get_output_headers(req[0]), "Connection", "close");
-	evhttp_add_header(evhttp_request_get_output_headers(req[0]), "Empty", "itis");
-	evhttp_add_header(evhttp_request_get_output_headers(req[1]), "Host", "somehost");
-	evhttp_add_header(evhttp_request_get_output_headers(req[1]), "Connection", "close");
-	evhttp_add_header(evhttp_request_get_output_headers(req[1]), "Empty", "itis");
+	for (i = 0; i < ARRAY_SIZE(req); ++i) {
+		evhttp_add_header(evhttp_request_get_output_headers(req[i]), "Host", "somehost");
+		evhttp_add_header(evhttp_request_get_output_headers(req[i]), "Connection", "close");
+		evhttp_add_header(evhttp_request_get_output_headers(req[i]), "Empty", "itis");
 
-	/* We give ownership of the request to the connection */
-	if (evhttp_make_request(evcon, req[0], EVHTTP_REQ_GET, "/test") == -1) {
-		tt_abort_msg("couldn't make request");
-	}
-	if (evhttp_make_request(evcon, req[1], EVHTTP_REQ_GET, "/test") == -1) {
-		tt_abort_msg("couldn't make request");
+		if (evhttp_make_request(evcon, req[i], EVHTTP_REQ_GET, "/test") == -1) {
+			tt_abort_msg("couldn't make request");
+		}
 	}
 
 	/*
@@ -1542,7 +1584,8 @@ http_autofree_connection_test(void *arg)
 	evhttp_connection_free_on_completion(evcon);
 	evcon = NULL;
 
-	event_base_dispatch(data->base);
+	for (i = 0; i < ARRAY_SIZE(req); ++i)
+		event_base_dispatch(data->base);
 
 	/* at this point, the http server should have no connection */
 	tt_assert(TAILQ_FIRST(&http->connections) == NULL);
@@ -1694,7 +1737,7 @@ http_cancel_test(void *arg)
 	if (type & BY_HOST) {
 		const char *timeout = (type & NS_TIMEOUT) ? "6" : "3";
 
-		tt_assert(regress_dnsserver(data->base, &portnum, search_table));
+		tt_assert(regress_dnsserver(data->base, &portnum, search_table, NULL));
 
 		dns_base = evdns_base_new(data->base, 0/* init name servers */);
 		tt_assert(dns_base);
@@ -2806,6 +2849,8 @@ http_parse_uri_test(void *ptr)
 	    nonconform ? EVHTTP_URI_NONCONFORMANT : 0;
 	struct evhttp_uri *uri = NULL;
 	char url_tmp[4096];
+#define URI_PARSE_FLAGS(uri, flags) \
+	evhttp_uri_parse_with_flags((uri), flags)
 #define URI_PARSE(uri) \
 	evhttp_uri_parse_with_flags((uri), parse_flags)
 
@@ -3176,6 +3221,29 @@ http_parse_uri_test(void *ptr)
 	tt_want(strcmp(evhttp_uri_get_fragment(uri), "fr?ed") == 0);
 	TT_URI("#fr?ed");
 	evhttp_uri_free(uri);
+
+	// EVHTTP_URI_HOST_STRIP_BRACKETS
+	uri = URI_PARSE_FLAGS("ftp://[ff00::127.0.0.1]/?q=test", EVHTTP_URI_HOST_STRIP_BRACKETS);
+	tt_want(strcmp(evhttp_uri_get_scheme(uri), "ftp") == 0);
+	tt_want(strcmp(evhttp_uri_get_host(uri), "ff00::127.0.0.1") == 0);
+	tt_want(strcmp(evhttp_uri_get_path(uri), "/") == 0);
+	tt_want(strcmp(evhttp_uri_get_query(uri), "q=test") == 0);
+	tt_want(evhttp_uri_get_userinfo(uri) == NULL);
+	tt_want(evhttp_uri_get_port(uri) == -1);
+	tt_want(evhttp_uri_get_fragment(uri) == NULL);
+	TT_URI("ftp://[ff00::127.0.0.1]/?q=test");
+
+	tt_want(0 == evhttp_uri_set_host(uri, "foo"));
+	tt_want(strcmp(evhttp_uri_get_host(uri), "foo") == 0);
+	TT_URI("ftp://foo/?q=test");
+
+	tt_want(0 == evhttp_uri_set_host(uri, "[ff00::127.0.0.1]"));
+	tt_want(strcmp(evhttp_uri_get_host(uri), "ff00::127.0.0.1") == 0);
+	TT_URI("ftp://[ff00::127.0.0.1]/?q=test");
+
+	evhttp_uri_free(uri);
+
+#undef URI_PARSE_FLAGS
 #undef URI_PARSE
 #undef TT_URI
 #undef BAD
@@ -3386,7 +3454,7 @@ http_incomplete_test_(struct basic_test_data *data, int use_timeout, int ssl)
 	const char *http_request;
 	ev_uint16_t port = 0;
 	struct timeval tv_start, tv_end;
-	struct evhttp *http = http_setup(&port, data->base, ssl ? HTTP_BIND_SSL : 0);
+	struct evhttp *http = http_setup(&port, data->base, ssl);
 
 	exit_base = data->base;
 	test_ok = 0;
@@ -3397,7 +3465,7 @@ http_incomplete_test_(struct basic_test_data *data, int use_timeout, int ssl)
 	tt_assert(fd != EVUTIL_INVALID_SOCKET);
 
 	/* Stupid thing to send a request */
-	bev = create_bev(data->base, fd, ssl);
+	bev = create_bev(data->base, fd, ssl, 0);
 	bufferevent_setcb(bev,
 	    http_incomplete_readcb, http_incomplete_writecb,
 	    http_incomplete_errorcb, use_timeout ? NULL : &fd);
@@ -3594,10 +3662,112 @@ http_chunked_request_done(struct evhttp_request *req, void *arg)
 }
 
 static void
+http_send_chunk_test_read_cb(struct bufferevent *bev, void *arg)
+{
+	TT_BLATHER(("%s: called\n", __func__));
+}
+/* sends 3 chunks */
+static void
+http_send_chunk_test_write_cb(struct bufferevent *bev, void *arg)
+{
+	struct evbuffer *output = bufferevent_get_output(bev);
+
+	TT_BLATHER(("%s: called, test_ok=%i\n", __func__, test_ok));
+
+	if (test_ok < 3) {
+		size_t len = strlen(BASIC_REQUEST_BODY) + 1;
+		evbuffer_add_printf(output, "%x\r\n", (unsigned)len);
+		evbuffer_add(output, BASIC_REQUEST_BODY, strlen(BASIC_REQUEST_BODY));
+		/* to allow using evbuffer_readln() for simplicity */
+		evbuffer_add(output, "\n", 1);
+		evbuffer_add(output, "\r\n", 2);
+	} else if (test_ok == 3) {
+		/* last chunk */
+		evbuffer_add(output, "0\r\n\r\n", 5);
+	} else {
+		/* stop */
+		bufferevent_disable(bev, EV_WRITE);
+		bufferevent_enable(bev, EV_READ);
+	}
+
+	test_ok++;
+}
+static void
+http_send_chunk_test_error_cb(struct bufferevent *bev, short what, void *arg)
+{
+	struct evbuffer *input = bufferevent_get_input(bev);
+	char *line;
+
+	TT_BLATHER(("%s: called\n", __func__));
+
+	test_ok = 0;
+
+	/* suboptimal */
+	while (evbuffer_get_length(input)) {
+		size_t n_read_out = 0;
+		line = evbuffer_readln(input, &n_read_out, EVBUFFER_EOL_LF);
+		if (!line)
+			break;
+		/* don't bother about parsing http request,
+		 * just count number of BASIC_REQUEST_BODY */
+		if (strcmp(line, BASIC_REQUEST_BODY) == 0) {
+			++test_ok;
+		}
+		free(line);
+	}
+
+	event_base_loopexit(exit_base, NULL);
+}
+static void
+http_send_chunk_test(void *arg)
+{
+	struct basic_test_data *data = arg;
+	struct bufferevent *bev = NULL;
+	evutil_socket_t fd;
+	const char *http_request;
+	ev_uint16_t port = 0;
+	struct evhttp *http = http_setup(&port, data->base, 0 /* ssl */);
+
+	exit_base = data->base;
+	test_ok = 0;
+
+	fd = http_connect("127.0.0.1", port);
+	tt_assert(fd != EVUTIL_INVALID_SOCKET);
+
+	bev = create_bev(data->base, fd, 0 /* ssl */, BEV_OPT_CLOSE_ON_FREE);
+	bufferevent_setcb(bev,
+	    http_send_chunk_test_read_cb,
+	    http_send_chunk_test_write_cb,
+	    http_send_chunk_test_error_cb,
+	    data->base);
+
+	http_request =
+	    "POST /chunked_input HTTP/1.1\r\n"
+	    "Host: somehost\r\n"
+	    "Transfer-Encoding: chunked\r\n"
+	    "Connection: close\r\n"
+	    "\r\n";
+
+	bufferevent_write(bev, http_request, strlen(http_request));
+
+	event_base_dispatch(data->base);
+
+	/**
+	 * http_send_chunk_test_error_cb() find BASIC_REQUEST_BODY 3 times
+	 */
+	tt_int_op(test_ok, ==, 3);
+
+ end:
+	if (bev)
+		bufferevent_free(bev);
+	if (http)
+		evhttp_free(http);
+}
+static void
 http_chunk_out_test_impl(void *arg, int ssl)
 {
 	struct basic_test_data *data = arg;
-	struct bufferevent *bev;
+	struct bufferevent *bev = NULL;
 	evutil_socket_t fd;
 	const char *http_request;
 	ev_uint16_t port = 0;
@@ -3605,7 +3775,7 @@ http_chunk_out_test_impl(void *arg, int ssl)
 	struct evhttp_connection *evcon = NULL;
 	struct evhttp_request *req = NULL;
 	int i;
-	struct evhttp *http = http_setup(&port, data->base, ssl ? HTTP_BIND_SSL : 0);
+	struct evhttp *http = http_setup(&port, data->base, ssl);
 
 	exit_base = data->base;
 	test_ok = 0;
@@ -3614,7 +3784,7 @@ http_chunk_out_test_impl(void *arg, int ssl)
 	tt_assert(fd != EVUTIL_INVALID_SOCKET);
 
 	/* Stupid thing to send a request */
-	bev = create_bev(data->base, fd, ssl);
+	bev = create_bev(data->base, fd, ssl, BEV_OPT_CLOSE_ON_FREE);
 	bufferevent_setcb(bev,
 	    http_chunked_readcb, http_chunked_writecb,
 	    http_chunked_errorcb, data->base);
@@ -3632,6 +3802,7 @@ http_chunk_out_test_impl(void *arg, int ssl)
 	event_base_dispatch(data->base);
 
 	bufferevent_free(bev);
+	bev = NULL;
 
 	evutil_gettimeofday(&tv_end, NULL);
 	evutil_timersub(&tv_end, &tv_start, &tv_end);
@@ -3641,7 +3812,7 @@ http_chunk_out_test_impl(void *arg, int ssl)
 	tt_int_op(test_ok, ==, 2);
 
 	/* now try again with the regular connection object */
-	bev = create_bev(data->base, -1, ssl);
+	bev = create_bev(data->base, -1, ssl, BEV_OPT_CLOSE_ON_FREE);
 	evcon = evhttp_connection_base_bufferevent_new(
 		data->base, NULL, bev, "127.0.0.1", port);
 	tt_assert(evcon);
@@ -3649,14 +3820,13 @@ http_chunk_out_test_impl(void *arg, int ssl)
 	/* make two requests to check the keepalive behavior */
 	for (i = 0; i < 2; i++) {
 		test_ok = 0;
-		req = evhttp_request_new(http_chunked_request_done,data->base);
+		req = evhttp_request_new(http_chunked_request_done, data->base);
 
 		/* Add the information that we care about */
 		evhttp_add_header(evhttp_request_get_output_headers(req), "Host", "somehost");
 
 		/* We give ownership of the request to the connection */
-		if (evhttp_make_request(evcon, req,
-			EVHTTP_REQ_GET, "/chunked") == -1) {
+		if (evhttp_make_request(evcon, req, EVHTTP_REQ_GET, "/chunked") == -1) {
 			tt_abort_msg("Couldn't make request");
 		}
 
@@ -3682,12 +3852,12 @@ http_stream_out_test_impl(void *arg, int ssl)
 	struct evhttp_connection *evcon = NULL;
 	struct evhttp_request *req = NULL;
 	struct bufferevent *bev;
-	struct evhttp *http = http_setup(&port, data->base, ssl ? HTTP_BIND_SSL : 0);
+	struct evhttp *http = http_setup(&port, data->base, ssl);
 
 	test_ok = 0;
 	exit_base = data->base;
 
-	bev = create_bev(data->base, -1, ssl);
+	bev = create_bev(data->base, -1, ssl, 0);
 	evcon = evhttp_connection_base_bufferevent_new(
 		data->base, NULL, bev, "127.0.0.1", port);
 	tt_assert(evcon);
@@ -3879,7 +4049,7 @@ http_connection_fail_test_impl(void *arg, int ssl)
 	struct evhttp_connection *evcon = NULL;
 	struct evhttp_request *req = NULL;
 	struct bufferevent *bev;
-	struct evhttp *http = http_setup(&port, data->base, ssl ? HTTP_BIND_SSL : 0);
+	struct evhttp *http = http_setup(&port, data->base, ssl);
 
 	exit_base = data->base;
 	test_ok = 0;
@@ -3887,7 +4057,7 @@ http_connection_fail_test_impl(void *arg, int ssl)
 	/* auto detect a port */
 	evhttp_free(http);
 
-	bev = create_bev(data->base, -1, ssl);
+	bev = create_bev(data->base, -1, ssl, 0);
 	/* Pick an unroutable address. This administratively scoped multicast
 	 * address should do when working with TCP. */
 	evcon = evhttp_connection_base_bufferevent_new(
@@ -3943,7 +4113,7 @@ static void
 http_make_web_server(evutil_socket_t fd, short what, void *arg)
 {
 	struct http_server *hs = (struct http_server *)arg;
-	hs->http = http_setup(&hs->port, http_make_web_server_base, hs->ssl ? HTTP_BIND_SSL : 0);
+	hs->http = http_setup(&hs->port, http_make_web_server_base, hs->ssl);
 }
 
 static void
@@ -3954,14 +4124,17 @@ http_simple_test_impl(void *arg, int ssl, int dirty, const char *uri)
 	struct evhttp_request *req = NULL;
 	struct bufferevent *bev;
 	struct http_server hs = { 0, ssl, NULL, };
-	struct evhttp *http = http_setup(&hs.port, data->base, ssl ? HTTP_BIND_SSL : 0);
+	struct evhttp *http = http_setup(&hs.port, data->base, ssl);
 
 	exit_base = data->base;
 	test_ok = 0;
 
-	bev = create_bev(data->base, -1, ssl);
+	bev = create_bev(data->base, -1, ssl, 0);
 #ifdef EVENT__HAVE_OPENSSL
 	bufferevent_openssl_set_allow_dirty_shutdown(bev, dirty);
+#endif
+#ifdef EVENT__HAVE_MBEDTLS
+	bufferevent_mbedtls_set_allow_dirty_shutdown(bev, dirty);
 #endif
 
 	evcon = evhttp_connection_base_bufferevent_new(
@@ -3998,7 +4171,7 @@ http_connection_retry_test_basic(void *arg, const char *addr, struct evdns_base 
 	struct timeval tv, tv_start, tv_end;
 	struct bufferevent *bev;
 	struct http_server hs = { 0, ssl, NULL, };
-	struct evhttp *http = http_setup(&hs.port, data->base, ssl ? HTTP_BIND_SSL : 0);
+	struct evhttp *http = http_setup(&hs.port, data->base, ssl);
 
 	exit_base = data->base;
 	test_ok = 0;
@@ -4006,7 +4179,7 @@ http_connection_retry_test_basic(void *arg, const char *addr, struct evdns_base 
 	/* auto detect a port */
 	evhttp_free(http);
 
-	bev = create_bev(data->base, -1, ssl);
+	bev = create_bev(data->base, -1, ssl, 0);
 	evcon = evhttp_connection_base_bufferevent_new(data->base, dns_base, bev, addr, hs.port);
 	tt_assert(evcon);
 	if (dns_base)
@@ -4127,7 +4300,7 @@ http_connection_retry_conn_address_test_impl(void *arg, int ssl)
 	struct evdns_base *dns_base = NULL;
 	char address[64];
 
-	tt_assert(regress_dnsserver(data->base, &portnum, search_table));
+	tt_assert(regress_dnsserver(data->base, &portnum, search_table, NULL));
 	dns_base = evdns_base_new(data->base, 0/* init name servers */);
 	tt_assert(dns_base);
 
@@ -4664,7 +4837,7 @@ http_ipv6_for_domain_test_impl(void *arg, int family)
 	ev_uint16_t portnum = 0;
 	char address[64];
 
-	tt_assert(regress_dnsserver(data->base, &portnum, ipv6_search_table));
+	tt_assert(regress_dnsserver(data->base, &portnum, ipv6_search_table, NULL));
 
 	dns_base = evdns_base_new(data->base, 0/* init name servers */);
 	tt_assert(dns_base);
@@ -4787,14 +4960,14 @@ http_write_during_read_test_impl(void *arg, int ssl)
 	struct timeval tv;
 	evutil_socket_t fd;
 	const char *http_request;
-	struct evhttp *http = http_setup(&port, data->base, ssl ? HTTP_BIND_SSL : 0);
+	struct evhttp *http = http_setup(&port, data->base, ssl);
 
 	test_ok = 0;
 	exit_base = data->base;
 
 	fd = http_connect("127.0.0.1", port);
 	tt_assert(fd != EVUTIL_INVALID_SOCKET);
-	bev = create_bev(data->base, fd, 0);
+	bev = create_bev(data->base, fd, ssl, 0);
 	bufferevent_setcb(bev, NULL, NULL, NULL, data->base);
 	bufferevent_disable(bev, EV_READ);
 
@@ -4866,7 +5039,7 @@ static void http_run_bev_request(struct event_base *base, int port,
 	tt_assert(fd != EVUTIL_INVALID_SOCKET);
 
 	/* Stupid thing to send a request */
-	bev = create_bev(base, fd, 0);
+	bev = create_bev(base, fd, 0, 0);
 	bufferevent_setcb(bev, http_readcb, http_writecb,
 	    http_errorcb, base);
 	out = bufferevent_get_output(bev);
@@ -5092,8 +5265,6 @@ http_timeout_read_client_test(void *arg)
  * Error callback tests
  */
 
-#define ARRAY_SIZE(x) (sizeof(x)/sizeof((x)[0]))
-
 #define ERRCBFLAG_GENCB  (0x01)
 #define ERRCBFLAG_ERRCB  (0x02)
 #define ERRCBFLAG_BOTHCB (ERRCBFLAG_GENCB | ERRCBFLAG_ERRCB)
@@ -5179,8 +5350,8 @@ http_error_callback_test_done(struct evhttp_request *req, void *arg)
 	test_info = state_info->test;
 
 	tt_assert(req);
-	tt_int_op(evhttp_request_get_command(req), ==,
-	    test_info->type);
+	tt_assert_op_type(evhttp_request_get_command(req), ==,
+	    test_info->type, enum evhttp_cmd_type, "%d");
 	tt_int_op(evhttp_request_get_response_code(req), ==,
 	    test_info->response_code);
 
@@ -5294,7 +5465,7 @@ http_timeout_read_server_test(void *arg)
 	evhttp_set_read_timeout_tv(http, &tv);
 
 	fd = http_connect("127.0.0.1", port);
-	bev = create_bev(data->base, fd, 0);
+	bev = create_bev(data->base, fd, 0, 0);
 	bufferevent_setcb(bev, http_readcb, http_writecb, http_errorcb, data->base);
 	out = bufferevent_get_output(bev);
 
@@ -5322,6 +5493,75 @@ http_timeout_read_server_test(void *arg)
 
 
 
+static void
+http_max_connections_test(void *arg)
+{
+	struct basic_test_data *data = arg;
+	ev_uint16_t port = 0;
+	struct evhttp *http = http_setup(&port, data->base, 0);
+	struct evhttp_connection *evcons[2];
+	struct http_newreqcb_test_state newreqcb_test_state;
+	unsigned n;
+
+	exit_base = data->base;
+	test_ok = 0;
+
+	memset(&newreqcb_test_state, 0, sizeof(newreqcb_test_state));
+	memset(evcons, 0, sizeof(evcons));
+
+	evhttp_set_max_connections(http, ARRAY_SIZE(evcons)-1);
+
+	for (n = 0; n < sizeof(evcons)/sizeof(evcons[0]); ++n) {
+		struct evhttp_connection* evcon = NULL;
+		struct evhttp_request *req = NULL;
+		evcons[n] = evhttp_connection_base_new(data->base, NULL, "127.0.0.1", port);
+		evcon = evcons[n];
+		evhttp_connection_set_retries(evcon, 0);
+
+		tt_assert(evcon);
+
+		req = evhttp_request_new(http_request_done_newreqcb, &newreqcb_test_state);
+		evhttp_add_header(evhttp_request_get_output_headers(req), "Connection", "close");
+		evhttp_request_set_error_cb(req, http_request_error_newreqcb);
+
+		/* We give ownership of the request to the connection */
+		if (evhttp_make_request(evcon, req, EVHTTP_REQ_GET, "/test") == -1) {
+			tt_abort_msg("Couldn't make request");
+		}
+
+		++newreqcb_test_state.connections_started;
+		http_newreqcb_test_state_check(&newreqcb_test_state);
+	}
+
+	/* XXX: http_newreqcb_test_state_check will not stop the base, since:
+	 * - connections_done == 2
+	 * - connections_good == 1
+	 *
+	 * hence timeout
+	 */
+	{
+		struct timeval tv = { 0, 300e3 };
+		event_base_loopexit(data->base, &tv);
+	}
+
+	event_base_dispatch(data->base);
+
+	http_newreqcb_test_state_check(&newreqcb_test_state);
+	tt_int_op(newreqcb_test_state.connections_error, ==, 0);
+	tt_int_op(newreqcb_test_state.connections_done, ==, 2);
+	tt_int_op(newreqcb_test_state.connections_good, ==, 1);
+
+end:
+	evhttp_free(http);
+
+	for (n = 0; n < ARRAY_SIZE(evcons); ++n) {
+		if (evcons[n]) {
+			evhttp_connection_free(evcons[n]);
+		}
+	}
+}
+
+
 #define HTTP_LEGACY(name)						\
 	{ #name, run_legacy_test_fn, TT_ISOLATED|TT_LEGACY, &legacy_setup, \
 		    http_##name##_test }
@@ -5335,39 +5575,74 @@ http_timeout_read_server_test(void *arg)
 	{ #title, http_##name##_test, TT_ISOLATED|test_opts, &basic_setup, HTTP_CAST_ARG(arg) }
 #define HTTP(name) HTTP_N(name, name, 0, NULL)
 #define HTTPS(name) \
-	{ "https_" #name, https_##name##_test, TT_ISOLATED, &basic_setup, NULL }
+	{ "https_openssl_" #name, https_##name##_test, TT_ISOLATED, &basic_setup, NULL }
+#define HTTPS_MBEDTLS(name) \
+	{ "https_mbedtls_" #name, https_mbedtls_##name##_test, TT_ISOLATED, &mbedtls_setup, NULL }
 
 #ifdef EVENT__HAVE_OPENSSL
 static void https_basic_test(void *arg)
-{ http_basic_test_impl(arg, 1, "GET /test HTTP/1.1"); }
+{ http_basic_test_impl(arg, HTTP_OPENSSL, "GET /test HTTP/1.1"); }
 static void https_filter_basic_test(void *arg)
-{ http_basic_test_impl(arg, 1 | HTTP_SSL_FILTER, "GET /test HTTP/1.1"); }
+{ http_basic_test_impl(arg, HTTP_OPENSSL | HTTP_SSL_FILTER, "GET /test HTTP/1.1"); }
 static void https_incomplete_test(void *arg)
-{ http_incomplete_test_(arg, 0, 1); }
+{ http_incomplete_test_(arg, 0, HTTP_OPENSSL); }
 static void https_incomplete_timeout_test(void *arg)
-{ http_incomplete_test_(arg, 1, 1); }
+{ http_incomplete_test_(arg, 1, HTTP_OPENSSL); }
 static void https_simple_test(void *arg)
-{ http_simple_test_impl(arg, 1, 0, "/test"); }
+{ http_simple_test_impl(arg, HTTP_OPENSSL, 0, "/test"); }
 static void https_simple_dirty_test(void *arg)
-{ http_simple_test_impl(arg, 1, 1, "/test"); }
+{ http_simple_test_impl(arg, HTTP_OPENSSL, 1, "/test"); }
 static void https_connection_retry_conn_address_test(void *arg)
-{ http_connection_retry_conn_address_test_impl(arg, 1); }
+{ http_connection_retry_conn_address_test_impl(arg, HTTP_OPENSSL); }
 static void https_connection_retry_test(void *arg)
-{ http_connection_retry_test_impl(arg, 1); }
+{ http_connection_retry_test_impl(arg, HTTP_OPENSSL); }
 static void https_chunk_out_test(void *arg)
-{ http_chunk_out_test_impl(arg, 1); }
+{ http_chunk_out_test_impl(arg, HTTP_OPENSSL); }
 static void https_filter_chunk_out_test(void *arg)
-{ http_chunk_out_test_impl(arg, 1 | HTTP_SSL_FILTER); }
+{ http_chunk_out_test_impl(arg, HTTP_OPENSSL | HTTP_SSL_FILTER); }
 static void https_stream_out_test(void *arg)
-{ http_stream_out_test_impl(arg, 1); }
+{ http_stream_out_test_impl(arg, HTTP_OPENSSL); }
 static void https_connection_fail_test(void *arg)
-{ http_connection_fail_test_impl(arg, 1); }
+{ http_connection_fail_test_impl(arg, HTTP_OPENSSL); }
 static void https_write_during_read_test(void *arg)
-{ http_write_during_read_test_impl(arg, 1); }
+{ http_write_during_read_test_impl(arg, HTTP_OPENSSL); }
 static void https_connection_test(void *arg)
-{ http_connection_test_(arg, 0, "127.0.0.1", NULL, 0, AF_UNSPEC, 1); }
+{ http_connection_test_(arg, 0, "127.0.0.1", NULL, 0, AF_UNSPEC, HTTP_OPENSSL); }
 static void https_persist_connection_test(void *arg)
-{ http_connection_test_(arg, 1, "127.0.0.1", NULL, 0, AF_UNSPEC, 1); }
+{ http_connection_test_(arg, 1, "127.0.0.1", NULL, 0, AF_UNSPEC, HTTP_OPENSSL); }
+#endif
+
+#ifdef EVENT__HAVE_MBEDTLS
+static void https_mbedtls_basic_test(void *arg)
+{ http_basic_test_impl(arg, HTTP_MBEDTLS, "GET /test HTTP/1.1"); }
+static void https_mbedtls_filter_basic_test(void *arg)
+{ http_basic_test_impl(arg, HTTP_MBEDTLS | HTTP_SSL_FILTER, "GET /test HTTP/1.1"); }
+static void https_mbedtls_incomplete_test(void *arg)
+{ http_incomplete_test_(arg, 0, HTTP_MBEDTLS); }
+static void https_mbedtls_incomplete_timeout_test(void *arg)
+{ http_incomplete_test_(arg, 1, HTTP_MBEDTLS); }
+static void https_mbedtls_simple_test(void *arg)
+{ http_simple_test_impl(arg, HTTP_MBEDTLS, 0, "/test"); }
+static void https_mbedtls_simple_dirty_test(void *arg)
+{ http_simple_test_impl(arg, HTTP_MBEDTLS, 1, "/test"); }
+static void https_mbedtls_connection_retry_conn_address_test(void *arg)
+{ http_connection_retry_conn_address_test_impl(arg, HTTP_MBEDTLS); }
+static void https_mbedtls_connection_retry_test(void *arg)
+{ http_connection_retry_test_impl(arg, HTTP_MBEDTLS); }
+static void https_mbedtls_chunk_out_test(void *arg)
+{ http_chunk_out_test_impl(arg, HTTP_MBEDTLS); }
+static void https_mbedtls_filter_chunk_out_test(void *arg)
+{ http_chunk_out_test_impl(arg, HTTP_MBEDTLS | HTTP_SSL_FILTER); }
+static void https_mbedtls_stream_out_test(void *arg)
+{ http_stream_out_test_impl(arg, HTTP_MBEDTLS); }
+static void https_mbedtls_connection_fail_test(void *arg)
+{ http_connection_fail_test_impl(arg, HTTP_MBEDTLS); }
+static void https_mbedtls_write_during_read_test(void *arg)
+{ http_write_during_read_test_impl(arg, HTTP_MBEDTLS); }
+static void https_mbedtls_connection_test(void *arg)
+{ http_connection_test_(arg, 0, "127.0.0.1", NULL, 0, AF_UNSPEC, HTTP_MBEDTLS); }
+static void https_mbedtls_persist_connection_test(void *arg)
+{ http_connection_test_(arg, 1, "127.0.0.1", NULL, 0, AF_UNSPEC, HTTP_MBEDTLS); }
 #endif
 
 struct testcase_t http_testcases[] = {
@@ -5429,6 +5704,7 @@ struct testcase_t http_testcases[] = {
 	HTTP(dispatcher),
 	HTTP(multi_line_header),
 	HTTP(negative_content_length),
+	HTTP(send_chunk),
 	HTTP(chunk_out),
 	HTTP(stream_out),
 
@@ -5459,6 +5735,7 @@ struct testcase_t http_testcases[] = {
 	HTTP(request_extra_body),
 
 	HTTP(newreqcb),
+	HTTP(max_connections),
 
 	HTTP(timeout_read_client),
 	HTTP(timeout_read_server),
@@ -5482,13 +5759,35 @@ struct testcase_t http_testcases[] = {
 	HTTPS(persist_connection),
 #endif
 
+#ifdef EVENT__HAVE_MBEDTLS
+	HTTPS_MBEDTLS(basic),
+	HTTPS_MBEDTLS(filter_basic),
+	HTTPS_MBEDTLS(simple),
+	HTTPS_MBEDTLS(simple_dirty),
+	HTTPS_MBEDTLS(incomplete),
+	HTTPS_MBEDTLS(incomplete_timeout),
+	{ "https_mbedtls_connection_retry", https_mbedtls_connection_retry_test, TT_ISOLATED|TT_OFF_BY_DEFAULT, &basic_setup, NULL },
+	{ "https_mbedtls_connection_retry_conn_address", https_mbedtls_connection_retry_conn_address_test,
+	  TT_ISOLATED|TT_OFF_BY_DEFAULT, &basic_setup, NULL },
+	HTTPS_MBEDTLS(chunk_out),
+	HTTPS_MBEDTLS(filter_chunk_out),
+	HTTPS_MBEDTLS(stream_out),
+	HTTPS_MBEDTLS(connection_fail),
+	HTTPS_MBEDTLS(write_during_read),
+	HTTPS_MBEDTLS(connection),
+	HTTPS_MBEDTLS(persist_connection),
+#endif
+
 	END_OF_TESTCASES
 };
 
 struct testcase_t http_iocp_testcases[] = {
 	{ "simple", http_simple_test, TT_FORK|TT_NEED_BASE|TT_ENABLE_IOCP, &basic_setup, NULL },
 #ifdef EVENT__HAVE_OPENSSL
-	{ "https_simple", https_simple_test, TT_FORK|TT_NEED_BASE|TT_ENABLE_IOCP, &basic_setup, NULL },
+	{ "https_openssl_simple", https_simple_test, TT_FORK|TT_NEED_BASE|TT_ENABLE_IOCP, &basic_setup, NULL },
+#endif
+#ifdef EVENT__HAVE_MBEDTLS
+	{ "https_mbedtls_simple", https_mbedtls_simple_test, TT_FORK|TT_NEED_BASE|TT_ENABLE_IOCP, &mbedtls_setup, NULL },
 #endif
 	END_OF_TESTCASES
 };

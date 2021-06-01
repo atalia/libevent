@@ -15,16 +15,17 @@ on:
 jobs:
   linux:
     runs-on: ubuntu-16.04
+    if: "!contains(github.event.head_commit.message, 'ci skip')"
     steps:
       - uses: actions/checkout@v2.0.0
       - name: Cache
         uses: actions/cache@v1.0.3
         with:
           path: build
-          key: ${{ matrix.os }}-coverage
+          key: ${{ matrix.os }}-coverage-v2
 
       - name: Install Depends
-        run: sudo apt install zlib1g-dev libssl-dev build-essential lcov
+        run: sudo apt install zlib1g-dev libssl-dev build-essential lcov libmbedtls-dev
 
       - name: Build And Test
         shell: bash

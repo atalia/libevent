@@ -19,13 +19,15 @@ on:
       - 'LICENSE'
 
 jobs:
-  windows:
-    runs-on: windows-2016
+  autotools:
+    runs-on: windows-2019
+    if: "!contains(github.event.head_commit.message, 'ci skip')"
     strategy:
       fail-fast: false
       matrix:
         EVENT_MATRIX:
           - none
+          - no-ssl
           - disable-openssl
           - disable-thread-support
           - disable-debug-mode
@@ -33,35 +35,26 @@ jobs:
 
     steps:
       - uses: actions/checkout@v2.0.0
-
-      - name: Cache MingW
-        id: cache-mingw
-        uses: actions/cache@v1.0.3
-        with:
-          path: D:\a\_temp\msys
-          key: windows-mingw
-
       - name: Cache Build
-        uses: actions/cache@v1.0.3
+        uses: actions/cache@v2
         with:
           path: build
-          key: mingw-${{ matrix.EVENT_MATRIX }}
-
-      - uses: numworks/setup-msys2@v1
-        if: steps.cache-mingw.outputs.cache-hit != 'true'
+          key: mingw-autotools-${{ matrix.EVENT_MATRIX }}-v4
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW64
-
-      - name: Install Dependes
-        if: steps.cache-mingw.outputs.cache-hit != 'true'
-        run: |
-          msys2do pacman -S --noconfirm mingw-w64-x86_64-gcc make autoconf automake libtool openssl-devel
+          update: true
+          install: mingw-w64-x86_64-gcc autoconf automake libtool mingw-w64-x86_64-openssl mingw-w64-x86_64-mbedtls
 
       - name: Build And Test
         shell: powershell
         run: |
           $env:EVENT_CONFIGURE_OPTIONS=""
-          if ( "${{ matrix.EVENT_MATRIX }}" -ne "none" ) {
+          if ( "${{ matrix.EVENT_MATRIX }}" -eq "no-ssl" ) {
+            $env:EVENT_CONFIGURE_OPTIONS="--disable-openssl --disable-mbedtls"
+          }
+          elseif ( "${{ matrix.EVENT_MATRIX }}" -ne "none" ) {
             $env:EVENT_CONFIGURE_OPTIONS="--${{ matrix.EVENT_MATRIX }}"
           }
           $env:EVENT_TESTS_PARALLEL=1
@@ -74,12 +67,86 @@ jobs:
           mkdir -p build
           cd build
           [[ $? -ne 0 ]] && exit 1
-          LDFLAGS="-L/usr/lib" CFLAGS="-I/usr/include" ../configure $EVENT_CONFIGURE_OPTIONS 2>&1
+          LDFLAGS="-L/mingw64/lib" CFLAGS="-I/mingw64/include" ../configure $EVENT_CONFIGURE_OPTIONS 2>&1
           [[ $? -ne 0 ]] && exit 1
           make -j $EVENT_BUILD_PARALLEL 2>&1
           [[ $? -ne 0 ]] && exit 1
           make verify -j $EVENT_TESTS_PARALLEL 2>&1 '
           D:\a\_temp\msys\msys64\usr\bin\bash.exe -c $script
+
+      - uses: actions/upload-artifact@v1
+        if: failure()
+        with:
+          name: mingw-${{ matrix.EVENT_MATRIX }}-build
+          path: build
+
+  cmake:
+    runs-on: windows-2019
+    if: "!contains(github.event.head_commit.message, 'ci skip')"
+    strategy:
+      fail-fast: false
+      matrix:
+        EVENT_MATRIX:
+          - NONE
+          - NO_SSL
+          - DISABLE_OPENSSL
+          - DISABLE_THREAD_SUPPORT
+          - DISABLE_DEBUG_MODE
+          - DISABLE_MM_REPLACEMENT
+
+    steps:
+      - uses: actions/checkout@v2.0.0
+      - name: Cache Build
+        uses: actions/cache@v2
+        with:
+          path: build
+          key: mingw-cmake-${{ matrix.EVENT_MATRIX }}-v4
+
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: mingw-w64-x86_64-gcc mingw-w64-x86_64-openssl mingw-w64-x86_64-mbedtls  
+
+      - name: Build And Test
+        shell: powershell
+        run: |
+          $EVENT_CONFIGURE_OPTIONS=""
+          if ( "${{ matrix.EVENT_MATRIX }}" -ne "NO_SSL" ) {
+            $EVENT_CONFIGURE_OPTIONS="-DEVENT__DISABLE_OPENSSL=ON -DEVENT__DISABLE_MBEDTLS=ON"
+          }
+          elseif ( "${{ matrix.EVENT_MATRIX }}" -ne "NONE" ) {
+            $EVENT_CONFIGURE_OPTIONS="-DEVENT__${{ matrix.EVENT_MATRIX }}=ON"
+          }
+          $env:PATH="D:\a\_temp\msys\msys64\mingw64\bin;D:\a\_temp\msys\msys64\usr\bin;$env:PATH"
+          mkdir build -ea 0
+          cd build
+          function cmake_configure($retry)
+          {
+            $errcode=0
+            try {
+              cmake .. -G "MSYS Makefiles" $EVENT_CONFIGURE_OPTIONS -DCMAKE_C_FLAGS=-w
+              $errcode=$LastExitCode
+            }
+            catch {
+              $errcode=1
+            }
+            finally {
+              if ($errcode -ne 0) {
+                if ($retry -eq 0) {
+                  $host.SetShouldExit($LastExitCode)
+                } else {
+                  echo "Remove all entries in build directory"
+                  rm -r -fo *
+                  cmake_configure 0
+                }
+              }
+            }
+          }
+          cmake_configure 1
+          cmake --build .
+          ctest -V
 
       - uses: actions/upload-artifact@v1
         if: failure()

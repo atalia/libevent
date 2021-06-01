@@ -37,10 +37,6 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 string(TOLOWER "${CMAKE_BUILD_TYPE}" CMAKE_BUILD_TYPE_LOWER)
 
-# get rid of the extra default configurations
-# what? why would you get id of other useful build types? - Ellzey
-set(CMAKE_CONFIGURATION_TYPES "Debug;Release" CACHE STRING "Limited configurations" FORCE)
-
 set(EVENT__LIBRARY_TYPE DEFAULT CACHE STRING
     "Set library type to SHARED/STATIC/BOTH (default SHARED for MSVC, otherwise BOTH)")
 
@@ -51,11 +47,8 @@ string(REGEX MATCH "SunOS" SOLARIS "${CMAKE_SYSTEM_NAME}")
 
 
 include(CheckTypeSize)
-include(CheckFunctionExistsEx)
 include(CheckFileOffsetBits)
-include(CheckFunctionExists)
-include(CheckIncludeFile)
-include(CheckIncludeFiles)
+include(Macros)
 include(CheckVariableExists)
 include(CheckSymbolExists)
 include(CheckStructHasMember)
@@ -135,6 +128,9 @@ option(EVENT__DISABLE_THREAD_SUPPORT
 option(EVENT__DISABLE_OPENSSL
     "Define if libevent should build without support for OpenSSL encryption" OFF)
 
+option(EVENT__DISABLE_MBEDTLS
+    "Define if libevent should build without support for mbed TLS encryption" OFF)
+
 option(EVENT__DISABLE_BENCHMARK
     "Defines if libevent should build without the benchmark executables" OFF)
 
@@ -189,9 +185,9 @@ if (EVENT__COVERAGE)
 
     message(STATUS "Setting coverage compiler flags")
 
-    set(CMAKE_REQUIRED_LIBRARIES "--coverage")
+    list(APPEND CMAKE_REQUIRED_LIBRARIES "--coverage")
     add_compiler_flags(-g -O0 --coverage)
-    set(CMAKE_REQUIRED_LIBRARIES "")
+    list(REMOVE_ITEM CMAKE_REQUIRED_LIBRARIES "--coverage")
 endif()
 
 set(GNUC 0)
@@ -236,6 +232,11 @@ elseif ("${EVENT_LIBRARY_TYPE}" STREQUAL "SHARED")
     set(EVENT_LIBRARY_SHARED ON)
 else()
     message(FATAL_ERROR "${EVENT_LIBRARY_TYPE} is not supported")
+endif()
+
+# brew support
+if (APPLE)
+    find_program(BREW brew)
 endif()
 
 if (${MSVC})
@@ -328,21 +329,31 @@ if (${GNUC})
 endif()
 
 if (APPLE)
-    # Get rid of deprecated warnings for OpenSSL on OSX 10.7 and greater.
+    # Clang on macOS emits warnings for each directory specified which isn't used
     add_compiler_flags(
-        -Wno-error=deprecated-declarations
         -Qunused-arguments
     )
 endif()
 
+if (MINGW OR CYGWIN)
+    set(WIN32 TRUE)
+endif()
+
 # Winsock.
 if(WIN32)
-    set(CMAKE_EXTRA_INCLUDE_FILES winsock2.h ws2tcpip.h)
-    set(CMAKE_REQUIRED_LIBRARIES  ws2_32.lib shell32.lib advapi32.lib)
-    set(CMAKE_REQUIRED_DEFINITIONS -FIwinsock2.h -FIws2tcpip.h)
+    list(APPEND CMAKE_REQUIRED_LIBRARIES
+        ws2_32
+        shell32
+        advapi32
+        bcrypt
+    )
+    set(CMAKE_REQUIRED_DEFINITIONS -FIwinsock2.h -FIws2tcpip.h -D_WIN32_WINNT=0x0600)
 endif()
 if (SOLARIS)
-    set(CMAKE_REQUIRED_LIBRARIES socket nsl)
+    list(APPEND CMAKE_REQUIRED_LIBRARIES
+        socket
+        nsl
+    )
 endif()
 
 # Check if _GNU_SOURCE is available.
@@ -361,154 +372,189 @@ endif()
 
 if (_GNU_SOURCE)
     add_definitions(-D_GNU_SOURCE=1)
+    set(CMAKE_REQUIRED_DEFINITIONS -D_GNU_SOURCE)
 endif()
 
-CHECK_INCLUDE_FILE(sys/types.h EVENT__HAVE_SYS_TYPES_H)
-if(EVENT__HAVE_SYS_TYPES_H)
-    list(APPEND CMAKE_EXTRA_INCLUDE_FILES sys/types.h)
+# Check if header files exist
+list(APPEND FILES_TO_CHECK
+    fcntl.h
+    inttypes.h
+    memory.h
+    signal.h
+    stdarg.h
+    stddef.h
+    stdint.h
+    stdlib.h
+    string.h
+    errno.h
+    unistd.h
+    time.h
+    sys/types.h
+    sys/stat.h
+    sys/time.h
+    sys/param.h
+)
+if (WIN32)
+    list(APPEND FILES_TO_CHECK
+        io.h
+        winsock2.h
+        ws2tcpip.h
+        afunix.h
+    )
+else()
+    list(APPEND FILES_TO_CHECK
+        netdb.h
+        dlfcn.h
+        arpa/inet.h
+        poll.h
+        port.h
+        sys/socket.h
+        sys/random.h
+        sys/un.h
+        sys/devpoll.h
+        sys/epoll.h
+        sys/eventfd.h
+        sys/event.h
+        sys/ioctl.h
+        sys/mman.h
+        sys/queue.h
+        sys/select.h
+        sys/sendfile.h
+        sys/uio.h
+        sys/wait.h
+        sys/resource.h
+        sys/timerfd.h
+        netinet/in.h
+        netinet/in6.h
+        netinet/tcp.h
+        ifaddrs.h
+    )
 endif()
 
-CHECK_INCLUDE_FILE(sys/socket.h EVENT__HAVE_SYS_SOCKET_H)
-if(EVENT__HAVE_SYS_SOCKET_H)
-    list(APPEND CMAKE_EXTRA_INCLUDE_FILES sys/socket.h)
+if (NOT "${CMAKE_HOST_SYSTEM_NAME}" STREQUAL "Linux")
+    list(APPEND FILES_TO_CHECK sys/sysctl.h)
 endif()
 
-CHECK_INCLUDE_FILE(sys/random.h EVENT__HAVE_SYS_RANDOM_H)
-if(EVENT__HAVE_SYS_RANDOM_H)
-    list(APPEND CMAKE_EXTRA_INCLUDE_FILES sys/random.h)
+if (APPLE)
+    list(APPEND FILES_TO_CHECK
+        mach/mach_time.h
+        mach/mach.h
+    )
 endif()
 
-CHECK_INCLUDE_FILE(netinet/in.h EVENT__HAVE_NETINET_IN_H)
-if(EVENT__HAVE_NETINET_IN_H)
-    list(APPEND CMAKE_EXTRA_INCLUDE_FILES netinet/in.h)
+if (NOT EVENT__DISABLE_THREAD_SUPPORT AND NOT WIN32)
+    list(APPEND FILES_TO_CHECK pthread.h)
+    # (Only `CHECK_TYPE_SIZE()' will use `CMAKE_EXTRA_INCLUDE_FILES')
+    list(APPEND CMAKE_EXTRA_INCLUDE_FILES pthread.h)
 endif()
 
-CHECK_INCLUDE_FILE(sys/un.h EVENT__HAVE_SYS_UN_H)
-if(EVENT__HAVE_SYS_UN_H)
-    list(APPEND CMAKE_EXTRA_INCLUDE_FILES sys/un.h)
+# Fills EVENT_INCLUDES
+foreach(FILE ${FILES_TO_CHECK})
+    CHECK_INCLUDE_FILE_CONCAT(${FILE} "EVENT")
+endforeach()
+unset(FILES_TO_CHECK)
+
+# Check if functions exist
+list(APPEND SYMBOLS_TO_CHECK
+    getaddrinfo
+    getnameinfo
+    getprotobynumber
+    getservbyname
+    gethostbyname
+    inet_ntop
+    inet_pton
+    gettimeofday
+    signal
+    strtoll
+    strlcpy
+    strsep
+    strtok_r
+    timerclear
+    timercmp
+    timerisset
+    timeradd
+    nanosleep
+    putenv
+    umask
+)
+if (NOT EVENT__DISABLE_CLOCK_GETTIME)
+    list(APPEND SYMBOLS_TO_CHECK clock_gettime)
 endif()
 
-if(WIN32)
-    CHECK_INCLUDE_FILE(afunix.h EVENT__HAVE_AFUNIX_H)
-    if(EVENT__HAVE_AFUNIX_H)
-        list(APPEND CMAKE_EXTRA_INCLUDE_FILES afunix.h)
+if (WIN32)
+    list(APPEND SYMBOLS_TO_CHECK
+        _gmtime64_s
+        _gmtime64
+    )
+else()
+    list(APPEND SYMBOLS_TO_CHECK
+        getifaddrs
+        select
+        epoll_create
+        epoll_create1
+        epoll_ctl
+        eventfd
+        poll
+        port_create
+        kqueue
+        fcntl
+        mmap
+        pipe
+        pipe2
+        sendfile
+        sigaction
+        strsignal
+        sysctl
+        accept4
+        arc4random
+        arc4random_buf
+        arc4random_addrandom
+        getrandom
+        getegid
+        geteuid
+        issetugid
+        usleep
+        timerfd_create
+        setenv
+        unsetenv
+        setrlimit
+        gethostbyname_r
+    )
+    if (APPLE)
+        list(APPEND SYMBOLS_TO_CHECK mach_absolute_time)
     endif()
 endif()
-CHECK_TYPE_SIZE("struct sockaddr_un" EVENT__HAVE_STRUCT_SOCKADDR_UN)
 
-CHECK_INCLUDE_FILE(netinet/in6.h EVENT__HAVE_NETINET_IN6_H)
-if(EVENT__HAVE_NETINET_IN6_H)
-    list(APPEND CMAKE_EXTRA_INCLUDE_FILES netinet/in6.h)
+if (NOT EVENT__DISABLE_THREAD_SUPPORT)
+    if (WIN32)
+        list(APPEND SRC_CORE evthread_win32.c)
+    else()
+        find_package(Threads REQUIRED)
+        if (NOT CMAKE_USE_PTHREADS_INIT)
+            message(FATAL_ERROR
+                    "Failed to find Pthreads, set EVENT__DISABLE_THREAD_SUPPORT to disable")
+        endif()
+
+        set(EVENT__HAVE_PTHREADS 1)
+        list(APPEND LIB_APPS ${CMAKE_THREAD_LIBS_INIT})
+
+        # for CHECK_SYMBOLS_EXIST()
+        list(APPEND CMAKE_REQUIRED_LIBRARIES ${CMAKE_THREAD_LIBS_INIT})
+
+        CHECK_TYPE_SIZE(pthread_t EVENT__SIZEOF_PTHREAD_T)
+        list(APPEND SYMBOLS_TO_CHECK pthread_mutexattr_setprotocol)
+    endif()
 endif()
 
-CHECK_INCLUDE_FILE(unistd.h EVENT__HAVE_UNISTD_H)
-CHECK_INCLUDE_FILE(netdb.h EVENT__HAVE_NETDB_H)
-CHECK_INCLUDE_FILE(dlfcn.h EVENT__HAVE_DLFCN_H)
-CHECK_INCLUDE_FILE(arpa/inet.h EVENT__HAVE_ARPA_INET_H)
-CHECK_INCLUDE_FILE(fcntl.h EVENT__HAVE_FCNTL_H)
-if(EVENT__HAVE_FCNTL_H)
-    list(APPEND CMAKE_EXTRA_INCLUDE_FILES fcntl.h)
+list(APPEND CMAKE_EXTRA_INCLUDE_FILES ${EVENT_INCLUDES} stdio.h)
+CHECK_SYMBOLS_EXIST("${SYMBOLS_TO_CHECK}" "${CMAKE_EXTRA_INCLUDE_FILES}" "EVENT")
+unset(SYMBOLS_TO_CHECK)
+set(EVENT__HAVE_EPOLL ${EVENT__HAVE_EPOLL_CREATE})
+if(WIN32 AND NOT CYGWIN)
+    set(EVENT__HAVE_WEPOLL 1)
 endif()
-CHECK_INCLUDE_FILE(inttypes.h EVENT__HAVE_INTTYPES_H)
-CHECK_INCLUDE_FILE(memory.h EVENT__HAVE_MEMORY_H)
-CHECK_INCLUDE_FILE(poll.h EVENT__HAVE_POLL_H)
-CHECK_INCLUDE_FILE(port.h EVENT__HAVE_PORT_H)
-if(EVENT__HAVE_PORT_H)
-    list(APPEND CMAKE_EXTRA_INCLUDE_FILES port.h)
-endif()
-CHECK_INCLUDE_FILE(signal.h EVENT__HAVE_SIGNAL_H)
-CHECK_INCLUDE_FILE(stdarg.h EVENT__HAVE_STDARG_H)
-CHECK_INCLUDE_FILE(stddef.h EVENT__HAVE_STDDEF_H)
-CHECK_INCLUDE_FILE(stdint.h EVENT__HAVE_STDINT_H)
-CHECK_INCLUDE_FILE(stdlib.h EVENT__HAVE_STDLIB_H)
-CHECK_INCLUDE_FILE(strings.h EVENT__HAVE_STRINGS_H)
-CHECK_INCLUDE_FILE(string.h EVENT__HAVE_STRING_H)
-CHECK_INCLUDE_FILE(sys/devpoll.h EVENT__HAVE_DEVPOLL)
-CHECK_INCLUDE_FILE(sys/epoll.h EVENT__HAVE_SYS_EPOLL_H)
-CHECK_INCLUDE_FILE(sys/eventfd.h EVENT__HAVE_SYS_EVENTFD_H)
-CHECK_INCLUDE_FILE(sys/event.h EVENT__HAVE_SYS_EVENT_H)
-CHECK_INCLUDE_FILE(sys/ioctl.h EVENT__HAVE_SYS_IOCTL_H)
-CHECK_INCLUDE_FILE(sys/mman.h EVENT__HAVE_SYS_MMAN_H)
-CHECK_INCLUDE_FILE(sys/param.h EVENT__HAVE_SYS_PARAM_H)
-CHECK_INCLUDE_FILE(sys/queue.h EVENT__HAVE_SYS_QUEUE_H)
-CHECK_INCLUDE_FILE(sys/select.h EVENT__HAVE_SYS_SELECT_H)
-CHECK_INCLUDE_FILE(sys/sendfile.h EVENT__HAVE_SYS_SENDFILE_H)
-CHECK_INCLUDE_FILE(sys/stat.h EVENT__HAVE_SYS_STAT_H)
-CHECK_INCLUDE_FILE(sys/time.h EVENT__HAVE_SYS_TIME_H)
-if(EVENT__HAVE_SYS_TIME_H)
-    list(APPEND CMAKE_EXTRA_INCLUDE_FILES sys/time.h)
-endif()
-CHECK_INCLUDE_FILE(sys/uio.h EVENT__HAVE_SYS_UIO_H)
-CHECK_INCLUDE_FILES("sys/types.h;ifaddrs.h" EVENT__HAVE_IFADDRS_H)
-CHECK_INCLUDE_FILE(mach/mach_time.h EVENT__HAVE_MACH_MACH_TIME_H)
-CHECK_INCLUDE_FILE(mach/mach.h EVENT__HAVE_MACH_MACH_H)
-CHECK_INCLUDE_FILE(netinet/tcp.h EVENT__HAVE_NETINET_TCP_H)
-CHECK_INCLUDE_FILE(sys/wait.h EVENT__HAVE_SYS_WAIT_H)
-CHECK_INCLUDE_FILE(sys/resource.h EVENT__HAVE_SYS_RESOURCE_H)
-if (NOT "${CMAKE_HOST_SYSTEM_NAME}" STREQUAL "Linux")
-    CHECK_INCLUDE_FILE(sys/sysctl.h EVENT__HAVE_SYS_SYSCTL_H)
-endif()
-CHECK_INCLUDE_FILE(sys/timerfd.h EVENT__HAVE_SYS_TIMERFD_H)
-CHECK_INCLUDE_FILE(errno.h EVENT__HAVE_ERRNO_H)
-
-
-CHECK_FUNCTION_EXISTS_EX(epoll_create EVENT__HAVE_EPOLL)
-CHECK_FUNCTION_EXISTS_EX(epoll_ctl EVENT__HAVE_EPOLL_CTL)
-CHECK_FUNCTION_EXISTS_EX(eventfd EVENT__HAVE_EVENTFD)
-if(NOT EVENT__DISABLE_CLOCK_GETTIME)
-    CHECK_FUNCTION_EXISTS_EX(clock_gettime EVENT__HAVE_CLOCK_GETTIME)
-endif()
-CHECK_FUNCTION_EXISTS_EX(fcntl EVENT__HAVE_FCNTL)
-CHECK_FUNCTION_EXISTS_EX(getaddrinfo EVENT__HAVE_GETADDRINFO)
-CHECK_FUNCTION_EXISTS_EX(getnameinfo EVENT__HAVE_GETNAMEINFO)
-CHECK_FUNCTION_EXISTS_EX(gettimeofday EVENT__HAVE_GETTIMEOFDAY)
-CHECK_FUNCTION_EXISTS_EX(getprotobynumber EVENT__HAVE_GETPROTOBYNUMBER)
-CHECK_FUNCTION_EXISTS_EX(getservbyname EVENT__HAVE_GETSERVBYNAME)
-CHECK_FUNCTION_EXISTS_EX(inet_ntop EVENT__HAVE_INET_NTOP)
-CHECK_FUNCTION_EXISTS_EX(inet_pton EVENT__HAVE_INET_PTON)
-CHECK_FUNCTION_EXISTS_EX(kqueue EVENT__HAVE_KQUEUE)
-CHECK_FUNCTION_EXISTS_EX(mmap EVENT__HAVE_MMAP)
-CHECK_FUNCTION_EXISTS_EX(pipe EVENT__HAVE_PIPE)
-CHECK_FUNCTION_EXISTS_EX(pipe2 EVENT__HAVE_PIPE2)
-CHECK_FUNCTION_EXISTS_EX(poll EVENT__HAVE_POLL)
-CHECK_FUNCTION_EXISTS_EX(port_create EVENT__HAVE_PORT_CREATE)
-CHECK_FUNCTION_EXISTS_EX(sendfile EVENT__HAVE_SENDFILE)
-CHECK_FUNCTION_EXISTS_EX(sigaction EVENT__HAVE_SIGACTION)
-CHECK_FUNCTION_EXISTS_EX(signal EVENT__HAVE_SIGNAL)
-CHECK_FUNCTION_EXISTS_EX(strsignal EVENT__HAVE_STRSIGNAL)
-CHECK_FUNCTION_EXISTS_EX(splice EVENT__HAVE_SPLICE)
-CHECK_FUNCTION_EXISTS_EX(strlcpy EVENT__HAVE_STRLCPY)
-CHECK_FUNCTION_EXISTS_EX(strsep EVENT__HAVE_STRSEP)
-CHECK_FUNCTION_EXISTS_EX(strtok_r EVENT__HAVE_STRTOK_R)
-CHECK_FUNCTION_EXISTS_EX(strtoll EVENT__HAVE_STRTOLL)
-CHECK_FUNCTION_EXISTS_EX(vasprintf EVENT__HAVE_VASPRINTF)
-CHECK_FUNCTION_EXISTS_EX(sysctl EVENT__HAVE_SYSCTL)
-CHECK_FUNCTION_EXISTS_EX(accept4 EVENT__HAVE_ACCEPT4)
-CHECK_FUNCTION_EXISTS_EX(arc4random EVENT__HAVE_ARC4RANDOM)
-CHECK_FUNCTION_EXISTS_EX(arc4random_buf EVENT__HAVE_ARC4RANDOM_BUF)
-CHECK_FUNCTION_EXISTS_EX(arc4random_addrandom EVENT__HAVE_ARC4RANDOM_ADDRANDOM)
-CHECK_FUNCTION_EXISTS_EX(epoll_create1 EVENT__HAVE_EPOLL_CREATE1)
-CHECK_FUNCTION_EXISTS_EX(getegid EVENT__HAVE_GETEGID)
-CHECK_FUNCTION_EXISTS_EX(geteuid EVENT__HAVE_GETEUID)
-CHECK_FUNCTION_EXISTS_EX(getifaddrs EVENT__HAVE_GETIFADDRS)
-CHECK_FUNCTION_EXISTS_EX(issetugid EVENT__HAVE_ISSETUGID)
-CHECK_FUNCTION_EXISTS_EX(mach_absolute_time EVENT__HAVE_MACH_ABSOLUTE_TIME)
-CHECK_FUNCTION_EXISTS_EX(nanosleep EVENT__HAVE_NANOSLEEP)
-CHECK_FUNCTION_EXISTS_EX(usleep EVENT__HAVE_USLEEP)
-CHECK_FUNCTION_EXISTS_EX(timeradd EVENT__HAVE_TIMERADD)
-CHECK_FUNCTION_EXISTS_EX(timerclear EVENT__HAVE_TIMERCLEAR)
-CHECK_FUNCTION_EXISTS_EX(timercmp EVENT__HAVE_TIMERCMP)
-CHECK_FUNCTION_EXISTS_EX(timerfd_create EVENT__HAVE_TIMERFD_CREATE)
-CHECK_FUNCTION_EXISTS_EX(timerisset EVENT__HAVE_TIMERISSET)
-CHECK_FUNCTION_EXISTS_EX(putenv EVENT__HAVE_PUTENV)
-CHECK_FUNCTION_EXISTS_EX(setenv EVENT__HAVE_SETENV)
-CHECK_FUNCTION_EXISTS_EX(setrlimit EVENT__HAVE_SETRLIMIT)
-CHECK_FUNCTION_EXISTS_EX(umask EVENT__HAVE_UMASK)
-CHECK_FUNCTION_EXISTS_EX(unsetenv EVENT__HAVE_UNSETENV)
 
 # Get the gethostbyname_r prototype.
-CHECK_FUNCTION_EXISTS_EX(gethostbyname_r EVENT__HAVE_GETHOSTBYNAME_R)
-
 if(EVENT__HAVE_GETHOSTBYNAME_R)
     CHECK_PROTOTYPE_DEFINITION(gethostbyname_r
         "int gethostbyname_r(const char *name, struct hostent *hp, struct hostent_data *hdata)"
@@ -533,17 +579,7 @@ if(HAVE_PORT_H AND HAVE_PORT_CREATE)
     set(EVENT__HAVE_EVENT_PORTS 1)
 endif()
 
-if(NOT WIN32)
-    CHECK_FUNCTION_EXISTS_EX(select EVENT__HAVE_SELECT)
-endif()
-
-if(WIN32)
-    CHECK_FUNCTION_EXISTS_EX(_gmtime64_s EVENT__HAVE__GMTIME64_S)
-    if (NOT EVENT__HAVE__GMTIME64_S)
-        CHECK_FUNCTION_EXISTS_EX(_gmtime64 EVENT__HAVE__GMTIME64)
-    endif()
-endif()
-
+CHECK_TYPE_SIZE("struct sockaddr_un" EVENT__HAVE_STRUCT_SOCKADDR_UN)
 CHECK_TYPE_SIZE("uint8_t" EVENT__HAVE_UINT8_T)
 CHECK_TYPE_SIZE("uint16_t" EVENT__HAVE_UINT16_T)
 CHECK_TYPE_SIZE("uint32_t" EVENT__HAVE_UINT32_T)
@@ -583,7 +619,6 @@ CHECK_SYMBOL_EXISTS(TAILQ_FOREACH sys/queue.h EVENT__HAVE_TAILQFOREACH)
 CHECK_CONST_EXISTS(CTL_KERN sys/sysctl.h EVENT__HAVE_DECL_CTL_KERN)
 CHECK_CONST_EXISTS(KERN_ARND sys/sysctl.h EVENT__HAVE_DECL_KERN_ARND)
 CHECK_SYMBOL_EXISTS(F_SETFD fcntl.h EVENT__HAVE_SETFD)
-CHECK_FUNCTION_EXISTS_EX(getrandom EVENT__HAVE_GETRANDOM)
 
 CHECK_TYPE_SIZE(fd_mask EVENT__HAVE_FD_MASK)
 
@@ -631,13 +666,6 @@ if(NOT EVENT__SIZEOF_PID_T)
   set(EVENT__SIZEOF_PID_T ${EVENT__SIZEOF_INT})
 else()
 	set(EVENT__SIZEOF_PID_T EVENT__SIZEOF_PID_T)
-endif()
-
-if (NOT EVENT__DISABLE_THREAD_SUPPORT)
-    if (NOT WIN32)
-        list(APPEND CMAKE_EXTRA_INCLUDE_FILES pthread.h)
-    endif()
-    CHECK_TYPE_SIZE(pthread_t EVENT__SIZEOF_PTHREAD_T)
 endif()
 
 if(EVENT__HAVE_CLOCK_GETTIME)
@@ -801,7 +829,7 @@ set(HDR_PUBLIC
     include/event2/visibility.h
     ${PROJECT_BINARY_DIR}/include/event2/event-config.h)
 
-set(SRC_CORE
+list(APPEND SRC_CORE
     buffer.c
     bufferevent.c
     bufferevent_filter.c
@@ -840,11 +868,31 @@ if(EVENT__HAVE_EPOLL)
     list(APPEND SRC_CORE epoll.c)
 endif()
 
+if(EVENT__HAVE_WEPOLL)
+    list(APPEND SRC_CORE
+        epoll.c
+        wepoll.c)
+endif()
+
 if(EVENT__HAVE_EVENT_PORTS)
     list(APPEND SRC_CORE evport.c)
 endif()
 
 if (NOT EVENT__DISABLE_OPENSSL)
+    # only if OPENSSL_ROOT_DIR is not set yet
+    if (BREW AND NOT OPENSSL_ROOT_DIR AND NOT "$ENV{OPENSSL_ROOT_DIR}")
+        execute_process(COMMAND ${BREW} --prefix openssl
+            OUTPUT_VARIABLE BREW_OPENSSL_PREFIX
+            RESULT_VARIABLE BREW_OPENSSL_RESULT
+            ERROR_QUIET
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+        )
+        if (BREW_OPENSSL_RESULT EQUAL 0)
+            message(STATUS "Set OPENSSL_ROOT_DIR=${BREW_OPENSSL_PREFIX} (from brew)")
+            set(OPENSSL_ROOT_DIR "${BREW_OPENSSL_PREFIX}" CACHE PATH "")
+        endif()
+    endif()
+
     find_package(OpenSSL REQUIRED)
 
     set(EVENT__HAVE_OPENSSL 1)
@@ -854,24 +902,24 @@ if (NOT EVENT__DISABLE_OPENSSL)
 
     include_directories(${OPENSSL_INCLUDE_DIR})
 
-    list(APPEND SRC_OPENSSL bufferevent_openssl.c)
+    list(APPEND SRC_OPENSSL bufferevent_openssl.c bufferevent_ssl.c)
     list(APPEND HDR_PUBLIC include/event2/bufferevent_ssl.h)
     list(APPEND LIB_APPS ${OPENSSL_LIBRARIES})
 endif()
 
-if (NOT EVENT__DISABLE_THREAD_SUPPORT)
-    if (WIN32)
-        list(APPEND SRC_CORE evthread_win32.c)
-    else()
-        find_package(Threads REQUIRED)
-        if (NOT CMAKE_USE_PTHREADS_INIT)
-            message(FATAL_ERROR
-                    "Failed to find Pthreads, set EVENT__DISABLE_THREAD_SUPPORT to disable")
-        endif()
+if (NOT EVENT__DISABLE_MBEDTLS)
+    find_package(MbedTLS REQUIRED)
 
-        set(EVENT__HAVE_PTHREADS 1)
-        list(APPEND LIB_APPS ${CMAKE_THREAD_LIBS_INIT})
-    endif()
+    set(EVENT__HAVE_MBEDTLS 1)
+
+    message(STATUS "mbed TLS include: ${MBEDTLS_INCLUDE_DIR}")
+    message(STATUS "mbed TLS lib: ${MBEDTLS_LIBRARIES}")
+
+    include_directories(${MBEDTLS_INCLUDE_DIR})
+
+    list(APPEND SRC_MBEDTLS bufferevent_mbedtls.c bufferevent_ssl.c)
+    list(APPEND HDR_PUBLIC include/event2/bufferevent_ssl.h)
+    list(APPEND LIB_APPS ${MBEDTLS_LIBRARIES})
 endif()
 
 if (NOT EVENT__DISABLE_TESTS)
@@ -910,7 +958,7 @@ if(WIN32)
     list(APPEND HDR_PRIVATE WIN32-Code/getopt.h)
 
     set(EVENT__DNS_USE_FTIME_FOR_ID 1)
-    set(LIB_PLATFORM ws2_32 shell32 advapi32)
+    set(LIB_PLATFORM ws2_32 shell32 advapi32 bcrypt)
     add_definitions(
             -D_CRT_SECURE_NO_WARNINGS
             -D_CRT_NONSTDC_NO_DEPRECATE)
@@ -964,7 +1012,15 @@ if (NOT EVENT__DISABLE_OPENSSL)
         SOURCES ${SRC_OPENSSL})
 endif()
 
-if (CMAKE_USE_PTHREADS_INIT)
+if (NOT EVENT__DISABLE_MBEDTLS)
+    add_event_library(event_mbedtls
+        INNER_LIBRARIES event_core
+        OUTER_INCLUDES ${MBEDTLS_INCLUDE_DIR}
+        LIBRARIES ${MBEDTLS_LIBRARIES}
+        SOURCES ${SRC_MBEDTLS})
+endif()
+
+if (EVENT__HAVE_PTHREADS)
     set(SRC_PTHREADS evthread_pthread.c)
     add_event_library(event_pthreads
         INNER_LIBRARIES event_core
@@ -1007,8 +1063,8 @@ macro(add_sample_prog ssl name)
                           ${LIB_APPS}
                           ${LIB_PLATFORM})
 
-    if (${ssl})
-        target_link_libraries(${name} event_openssl)
+    if (TARGET ${ssl})
+        target_link_libraries(${name} ${ssl})
         if(WIN32)
             target_link_libraries(${name} crypt32)
         endif()
@@ -1031,13 +1087,21 @@ if (NOT EVENT__DISABLE_SAMPLES)
     endif()
 
     if (NOT EVENT__DISABLE_OPENSSL)
-        add_sample_prog(ON https-client
+        add_sample_prog(event_openssl https-client
                         sample/https-client.c
                         sample/openssl_hostname_validation.c
                         sample/hostcheck.c)
-        add_sample_prog(ON le-proxy
+        add_sample_prog(event_openssl le-proxy
                         sample/le-proxy.c)
-        add_sample_prog(ON becat sample/becat.c ${WIN32_GETOPT})
+        add_sample_prog(event_openssl becat sample/becat.c ${WIN32_GETOPT})
+    endif()
+
+    if (NOT EVENT__DISABLE_MBEDTLS)
+        add_sample_prog(event_mbedtls https-client-mbedtls
+                sample/https-client.c)
+        target_compile_definitions(https-client-mbedtls PRIVATE USE_MBEDTLS)
+        add_sample_prog(event_mbedtls ssl-client-mbedtls
+                sample/ssl-client-mbedtls.c)
     endif()
 
     set(SAMPLES_WOPT
@@ -1112,7 +1176,7 @@ if (NOT EVENT__DISABLE_TESTS)
                 DEPENDS
                     event_rpcgen.py
                     test/regress.rpc
-                COMMAND ${PYTHON_EXECUTABLE} ../event_rpcgen.py regress.rpc
+                COMMAND ${PYTHON_EXECUTABLE} ../event_rpcgen.py --quiet regress.rpc
                 WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/test)
 
             list(APPEND SRC_REGRESS
@@ -1140,7 +1204,7 @@ if (NOT EVENT__DISABLE_TESTS)
                 if (NOT EVENT__DISABLE_THREAD_SUPPORT)
                     list(APPEND SRC_REGRESS test/regress_thread.c)
                 endif()
-            elseif (CMAKE_USE_PTHREADS_INIT)
+            elseif (EVENT__HAVE_PTHREADS)
                 list(APPEND SRC_REGRESS test/regress_thread.c)
             endif()
 
@@ -1149,7 +1213,11 @@ if (NOT EVENT__DISABLE_TESTS)
             endif()
 
             if (NOT EVENT__DISABLE_OPENSSL)
-                list(APPEND SRC_REGRESS test/regress_ssl.c)
+                list(APPEND SRC_REGRESS test/regress_openssl.c)
+            endif()
+
+            if (NOT EVENT__DISABLE_MBEDTLS)
+                list(APPEND SRC_REGRESS test/regress_mbedtls.c)
             endif()
 
             add_executable(regress ${SRC_REGRESS})
@@ -1161,6 +1229,9 @@ if (NOT EVENT__DISABLE_TESTS)
                                   event_extra)
             if (NOT EVENT__DISABLE_OPENSSL)
                 target_link_libraries(regress event_openssl)
+            endif()
+            if (NOT EVENT__DISABLE_MBEDTLS)
+                target_link_libraries(regress event_mbedtls)
             endif()
             if (CMAKE_USE_PTHREADS_INIT)
                 target_link_libraries(regress event_pthreads)
@@ -1189,6 +1260,7 @@ if (NOT EVENT__DISABLE_TESTS)
     # - ellzey
     set(TESTPROGS test-changelist
                   test-eof
+                  test-closed
                   test-fdleak
                   test-init
                   test-time
@@ -1238,6 +1310,10 @@ if (NOT EVENT__DISABLE_TESTS)
 
     if (EVENT__HAVE_DEVPOLL)
         list(APPEND BACKENDS DEVPOLL)
+    endif()
+
+    if (EVENT__HAVE_WEPOLL)
+        list(APPEND BACKENDS WEPOLL)
     endif()
 
     if (WIN32)
@@ -1382,13 +1458,12 @@ if (NOT EVENT__DISABLE_TESTS)
     #  If they are set in the shell the tests are running using simply "ctest" or "make test" will fail)
     if (WIN32)
         # Windows doesn't have "unset". But you can use "set VAR=" instead.
-        # We need to guard against the possibility taht EVENT_NOWIN32 is set, and all test failing
-        # since no event backend being available.
         file(TO_NATIVE_PATH ${CMAKE_CTEST_COMMAND} WINDOWS_CTEST_COMMAND)
 
         file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/tmp/verify_tests.bat
             "
             set EVENT_NOWIN32=
+            set EVENT_NOWEPOLL=
             \"${WINDOWS_CTEST_COMMAND}\"
             ")
 
@@ -1410,7 +1485,7 @@ if (NOT EVENT__DISABLE_TESTS)
         add_custom_target(verify COMMAND "${VERIFY_PATH}"
                           DEPENDS event ${ALL_TESTPROGS})
     else()
-        # On some platforms doing exec(unset) as CMake does won't work, so make sure
+        # On some platforms doing exec(unset) as CMake doesn't work, so make sure
         # we run the unset command in a shell instead.
         # First we write the script contents.
         file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/tmp/verify_tests.sh

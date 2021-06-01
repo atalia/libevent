@@ -300,6 +300,7 @@ int evutil_read_file_(const char *filename, char **content_out, size_t *len_out,
 EVENT2_EXPORT_SYMBOL
 int evutil_socket_connect_(evutil_socket_t *fd_ptr, const struct sockaddr *sa, int socklen);
 
+EVENT2_EXPORT_SYMBOL
 int evutil_socket_finished_connecting_(evutil_socket_t fd);
 
 #ifdef EVENT__HAVE_AFUNIX_H
@@ -308,7 +309,7 @@ int evutil_check_working_afunix_();
 #endif
 
 EVENT2_EXPORT_SYMBOL
-int evutil_ersatz_socketpair_(int, int , int, evutil_socket_t[]);
+int evutil_ersatz_socketpair_(int, int , int, evutil_socket_t[2]);
 
 int evutil_resolve_(int family, const char *hostname, struct sockaddr *sa,
     ev_socklen_t *socklen, int port);

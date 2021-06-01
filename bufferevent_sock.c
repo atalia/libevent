@@ -396,7 +396,7 @@ bufferevent_socket_connect(struct bufferevent *bev,
 		fd = evutil_socket_(sa->sa_family,
 		    SOCK_STREAM|EVUTIL_SOCK_NONBLOCK, 0);
 		if (fd < 0)
-			goto freesock;
+			goto done;
 		ownfd = 1;
 	}
 	if (sa) {
@@ -431,16 +431,11 @@ bufferevent_socket_connect(struct bufferevent *bev,
 			result = 0;
 			goto done;
 		}
-	} else if (r == 1) {
+	} else {
 		/* The connect succeeded already. How very BSD of it. */
 		result = 0;
 		bufev_p->connecting = 1;
 		bufferevent_trigger_nolock_(bev, EV_WRITE, BEV_OPT_DEFER_CALLBACKS);
-	} else {
-		/* The connect failed already.  How very BSD of it. */
-		result = 0;
-		bufferevent_run_eventcb_(bev, BEV_EVENT_ERROR, BEV_OPT_DEFER_CALLBACKS);
-		bufferevent_disable(bev, EV_WRITE|EV_READ);
 	}
 
 	goto done;
@@ -661,7 +656,7 @@ bufferevent_priority_set(struct bufferevent *bufev, int priority)
 	struct bufferevent_private *bufev_p = BEV_UPCAST(bufev);
 
 	BEV_LOCK(bufev);
-	if (!BEV_IS_SOCKET(bufev))
+	if (BEV_IS_ASYNC(bufev) || BEV_IS_FILTER(bufev) || BEV_IS_PAIR(bufev))
 		goto done;
 
 	if (event_priority_set(&bufev->ev_read, priority) == -1)

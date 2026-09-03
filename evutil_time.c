@@ -65,9 +65,15 @@
 
 #ifndef EVENT__HAVE_GETTIMEOFDAY
 /* No gettimeofday; this must be windows. */
+
+typedef void (WINAPI *GetSystemTimePreciseAsFileTime_fn_t) (LPFILETIME);
+
 int
 evutil_gettimeofday(struct timeval *tv, struct timezone *tz)
 {
+	static GetSystemTimePreciseAsFileTime_fn_t GetSystemTimePreciseAsFileTime_fn = NULL;
+	static int check_precise = 1;
+
 #ifdef _MSC_VER
 #define U64_LITERAL(n) n##ui64
 #else
@@ -90,7 +96,19 @@ evutil_gettimeofday(struct timeval *tv, struct timezone *tz)
 	if (tv == NULL)
 		return -1;
 
-	GetSystemTimeAsFileTime(&ft.ft_ft);
+	if (EVUTIL_UNLIKELY(check_precise)) {
+		HMODULE h = evutil_load_windows_system_library_(TEXT("kernel32.dll"));
+		if (h != NULL)
+			GetSystemTimePreciseAsFileTime_fn =
+				(GetSystemTimePreciseAsFileTime_fn_t)
+					GetProcAddress(h, "GetSystemTimePreciseAsFileTime");
+		check_precise = 0;
+	}
+
+	if (GetSystemTimePreciseAsFileTime_fn != NULL)
+		GetSystemTimePreciseAsFileTime_fn(&ft.ft_ft);
+	else
+		GetSystemTimeAsFileTime(&ft.ft_ft);
 
 	if (EVUTIL_UNLIKELY(ft.ft_64 < EPOCH_BIAS)) {
 		/* Time before the unix epoch. */
@@ -298,6 +316,8 @@ evutil_configure_monotonic_time_(struct evutil_monotonic_timer *base,
 	const int fallback = flags & EV_MONOT_FALLBACK;
 	struct timespec	ts;
 
+	memset(base, 0, sizeof(*base));
+
 #ifdef CLOCK_MONOTONIC_COARSE
 	if (CLOCK_MONOTONIC_COARSE < 0) {
 		/* Technically speaking, nothing keeps CLOCK_* from being
@@ -406,7 +426,7 @@ evutil_gettime_monotonic_(struct evutil_monotonic_timer *base,
 
 #if defined(HAVE_WIN32_MONOTONIC)
 /* =====
-   Turn we now to Windows.  Want monontonic time on Windows?
+   Turn we now to Windows.  Want monotonic time on Windows?
 
    Windows has QueryPerformanceCounter(), which gives time most high-
    resolution time.  It's a pity it's not so monotonic in practice; it's
@@ -556,7 +576,7 @@ evutil_gettime_monotonic_(struct evutil_monotonic_timer *base,
 			/* It appears that the QueryPerformanceCounter()
 			 * result is more than 1 second away from
 			 * GetTickCount() result. Let's adjust it to be as
-			 * accurate as we can; adjust_monotnonic_time() below
+			 * accurate as we can; adjust_monotonic_time() below
 			 * will keep it monotonic. */
 			counter_usec_elapsed = ticks_elapsed * 1000;
 			base->first_counter = (ev_uint64_t) (counter.QuadPart - counter_usec_elapsed / base->usec_per_count);

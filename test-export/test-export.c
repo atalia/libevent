@@ -1,4 +1,5 @@
 #include <event2/event.h>
+#include <stdlib.h>
 #if defined(EVENT_EXPORT_TEST_COMPONENT_EXTRA)
 #include "event2/http.h"
 #include "event2/rpc.h"
@@ -8,6 +9,9 @@
 #elif defined(EVENT_EXPORT_TEST_COMPONENT_OPENSSL)
 #include <openssl/ssl.h>
 #include <openssl/err.h>
+#include <event2/bufferevent_ssl.h>
+#elif defined(EVENT_EXPORT_TEST_COMPONENT_MBEDTLS)
+#include <mbedtls/ssl.h>
 #include <event2/bufferevent_ssl.h>
 #endif
 
@@ -88,6 +92,48 @@ error:
 		SSL_CTX_free(ssl_ctx);
 	if (ssl)
 		SSL_free(ssl);
+	return r;
+}
+#elif defined(EVENT_EXPORT_TEST_COMPONENT_MBEDTLS)
+static int
+test()
+{
+	struct event_base *base = NULL;
+	mbedtls_ssl_config *conf = NULL;
+	mbedtls_dyncontext *ssl = NULL;
+	struct bufferevent *bev;
+	int r = 1;
+
+	base = event_base_new();
+	if (!base) {
+		goto error;
+	}
+
+	conf = malloc(sizeof(*conf));
+	if (!conf) {
+		goto error;
+	}
+	mbedtls_ssl_config_init(conf);
+
+	ssl = bufferevent_mbedtls_dyncontext_new(conf);
+
+	bev = bufferevent_mbedtls_socket_new(base, -1, ssl,
+		BUFFEREVENT_SSL_CONNECTING,
+		BEV_OPT_CLOSE_ON_FREE | BEV_OPT_DEFER_CALLBACKS);
+	if (bev == NULL) {
+		goto error;
+	}
+	r = 0;
+error:
+	if (base)
+		event_base_free(base);
+	if (ssl) {
+		bufferevent_mbedtls_dyncontext_free(ssl);
+	}
+	if (conf) {
+		mbedtls_ssl_config_free(conf);
+		free(conf);
+	}
 	return r;
 }
 #else
